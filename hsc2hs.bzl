@@ -49,7 +49,15 @@ def _hsc2hs_impl(ctx: AnalysisContext) -> list[Provider]:
     )
     ctx.actions.run(cmd, category = "hsc2hs")
 
-    return [DefaultInfo(default_output = out)]
+    # Same as alex_happy.bzl: a .hs-boot file must sit next to the
+    # generated .hs, so it is copied into this rule's output directory and
+    # exposed as the sub-target named after its path.
+    sub_targets = {}
+    if ctx.attrs.boot != None:
+        boot_out = ctx.actions.declare_output(ctx.attrs.boot_out)
+        ctx.actions.copy_file(boot_out, ctx.attrs.boot)
+        sub_targets[ctx.attrs.boot_out] = [DefaultInfo(default_output = boot_out)]
+    return [DefaultInfo(default_output = out, sub_targets = sub_targets)]
 
 # Runs hsc2hs on `hsc_file`, producing `out`. `deps` is used purely to
 # collect C/C++ include paths (via CPreprocessorInfo); it doesn't need to be
@@ -57,6 +65,8 @@ def _hsc2hs_impl(ctx: AnalysisContext) -> list[Provider]:
 hsc2hs = rule(
     impl = _hsc2hs_impl,
     attrs = {
+        "boot": attrs.option(attrs.source(), default = None),
+        "boot_out": attrs.option(attrs.string(), default = None),
         "deps": attrs.list(attrs.dep(), default = []),
         "extra_flags": attrs.list(attrs.string(), default = []),
         "hsc_file": attrs.source(),
