@@ -57,6 +57,7 @@ load(
     "@prelude//haskell:compile.bzl",
     "CompileResultInfo",
     "compile",
+    "get_packages_info",
 )
 load(
     "@prelude//haskell:haskell_haddock.bzl",
@@ -86,7 +87,9 @@ load(
     "attr_deps_merged_link_infos",
     "attr_deps_profiling_link_infos",
     "attr_deps_shared_library_infos",
+    "attr_sublibraries_haskell_link_infos",
     "get_artifact_suffix",
+    "is_ghc_compiled_src",
     "is_haskell_src",
     "output_extensions",
     "src_to_module_name",
@@ -367,12 +370,24 @@ def haskell_prebuilt_library_impl(ctx: AnalysisContext) -> list[Provider]:
         linkable_graph,
     ]
 
-def _srcs_to_objfiles(ctx: AnalysisContext, odir: Artifact, osuf: str) -> list[Artifact]:
+def _srcs_to_objfiles(ctx: AnalysisContext, compiled: CompileResultInfo, osuf: str, c_osuf: [str, None] = None) -> list[Artifact]:
+    """The objects GHC compiled, `osuf` being their suffix; `c_osuf` is
+    the suffix of the objects of the C and Cmm sources when it differs (a
+    -dynamic-too compile gives them no .dyn_o, see compile.bzl)."""
     objfiles = []
     for src, _ in srcs_to_pairs(ctx.attrs.srcs):
         # Don't link boot sources, as they're only meant to be used for compiling.
         if is_haskell_src(src):
+            # A source with per_src_flags has its own output directory.
+            odir = compiled.persrc_objects.get(src, compiled.objects)
             objfiles.append(odir.project(paths.replace_extension(src, "." + osuf)))
+        elif is_ghc_compiled_src(src):
+            # A C or Cmm source: GHC puts its object under -odir at the
+            # source's path relative to the working directory (the project
+            # root), e.g. objects/rts/Apply.o, not at the module-like path
+            # it uses for Haskell sources.
+            odir = compiled.persrc_objects.get(src, compiled.objects)
+            objfiles.append(odir.project(paths.join(ctx.label.package, paths.replace_extension(src, "." + (c_osuf or osuf)))))
     return objfiles
 
 _REGISTER_PACKAGE = """\
@@ -432,12 +447,18 @@ def _make_package(
     # touches), so every package needs to be discoverable this way, not
     # just ones that use TH themselves.
     own_shared_lib: [Artifact, None] = None,
+    # False for a library without objects (see _build_haskell_lib): no
+    # library-dirs/extra-libraries in the registration.
+    has_objects: bool = True,
 ) -> Artifact:
     artifact_suffix = get_artifact_suffix(link_style, enable_profiling)
     hi_link_style = hi_link_style if hi_link_style != None else link_style
 
     # Don't expose boot sources, as they're only meant to be used for compiling.
     modules = [src_to_module_name(x) for x, _ in srcs_to_pairs(ctx.attrs.srcs) if is_haskell_src(x)]
+    for new, (dep, orig) in getattr(ctx.attrs, "reexported_modules", {}).items():
+        origin = dep[HaskellLibraryProvider].lib.values()[0].id if dep != None else pkgname
+        modules.append(new + " from " + origin + ":" + orig)
 
     if enable_profiling:
         # Add the `-p` suffix otherwise ghc will look for objects
@@ -452,20 +473,48 @@ def _make_package(
     library_dirs = [mk_artifact_dir("lib", profiled) for profiled in hi.keys()]
 
     conf = [
-        "name: " + pkgname,
-        "version: 1.0.0",
+        "name: " + (ctx.attrs.package_name if ctx.attrs.package_name != None else pkgname),
+        "version: " + ctx.attrs.version,
         "id: " + pkgname,
         "key: " + pkgname,
+    ] + ([
+        # A Cabal sub-library: GHC resolves a `pkg:lib` unit id (the rts
+        # ways of a GHC build) by these two fields.
+        "package-name: " + ctx.attrs.cabal_package,
+        "lib-name: " + ctx.attrs.lib_name,
+    ] if ctx.attrs.lib_name != None else []) + [
         "exposed: False",
         "exposed-modules: " + ", ".join(modules),
         "import-dirs:" + ", ".join(import_dirs),
+    ] + ([
         "library-dirs:" + ", ".join(library_dirs),
-        "extra-libraries: " + libname,
+        # A static-only library (GHC's stage 2) is a Haskell library of
+        # the registration: when GHC links a program by itself (an
+        # installation built with buck2), it puts the hs-libraries in
+        # dependency order, after the extra-libraries of the other units.
+        # A library with a shared variant stays an extra-library: GHC's
+        # interpreter loads it under that name, without the -ghc<version>
+        # suffix of a Haskell shared library.
+        ("hs-libraries: " if _attr_preferred_linkage(ctx) == Linkage("static") else "extra-libraries: ") + libname,
+    ] if has_objects else []) + [
         "depends: " + ", ".join([lib.id for lib in hlis]),
     ]
+    # The system libraries and linker options of the Cabal package
+    # (`extra-libraries: m`, `ld-options`), for a program GHC links by
+    # itself against this library.
+    sys_libs = [f[2:] for f in ctx.attrs.exported_linker_flags if f.startswith("-l")]
+    ld_options = [f for f in ctx.attrs.exported_linker_flags if not f.startswith("-l")]
+    if sys_libs:
+        conf.append("extra-libraries: " + ", ".join(sys_libs))
+    if ld_options:
+        conf.append("ld-options: " + " ".join(ld_options))
     if own_shared_lib != None:
         conf.append('dynamic-library-dirs:"${pkgroot}/lib-shared"')
-    pkg_conf = ctx.actions.write("pkg-" + artifact_suffix + ".conf", conf, has_content_based_path = False)
+    include_dirs = getattr(ctx.attrs, "include_dirs", [])
+    if include_dirs:
+        # absolute paths: GHC reads a unit's include-dirs from anywhere
+        conf.append(cmd_args("include-dirs: ", cmd_args(include_dirs, delimiter = ", "), delimiter = ""))
+    pkg_conf, _ = ctx.actions.write("pkg-" + artifact_suffix + ".conf", conf, has_content_based_path = False, allow_args = True, absolute = True)
 
     db = ctx.actions.declare_output("db-" + artifact_suffix, has_content_based_path = False)
 
@@ -686,9 +735,17 @@ def _build_haskell_lib(
     # only gather direct dependencies
     uniq_infos = [x[link_style].value for x in linfos]
 
-    objfiles = _srcs_to_objfiles(ctx, compiled.objects, osuf)
+    objfiles = _srcs_to_objfiles(ctx, compiled, osuf)
 
-    if link_style == LinkStyle("shared"):
+    if not objfiles:
+        # A library without objects: a header-only Cabal package (GHC's
+        # rts-headers, or its rts main library: headers and include-dirs).
+        # It is registered (GHC finds e.g. DerivedConstants.h through the
+        # rts unit's include-dirs) but there is no library to link.
+        lib = None
+        libs = []
+        link_infos = LinkInfos(default = LinkInfo(pre_flags = ctx.attrs.exported_linker_flags))
+    elif link_style == LinkStyle("shared"):
         lib, solib, link_infos = _link_haskell_shared_lib(
             ctx,
             haskell_toolchain,
@@ -703,7 +760,7 @@ def _build_haskell_lib(
         solibs[libfile] = solib
         libs = [lib]
 
-    else:  # static flavours
+    else:  # static flavours, with objects
         # TODO: avoid making an archive for a single object, like cxx does
         # (but would that work with Template Haskell?)
         # TODO: Opt haskell actions into content based paths.
@@ -723,7 +780,7 @@ def _build_haskell_lib(
             ),
         )
 
-    if enable_profiling and link_style != LinkStyle("shared"):
+    if enable_profiling and link_style != LinkStyle("shared") and objfiles:
         if not non_profiling_hlib:
             fail("Non-profiling HaskellLibBuildOutput wasn't provided when building profiling lib")
 
@@ -743,7 +800,7 @@ def _build_haskell_lib(
         }
         library_artifacts = {
             False: lib,
-        }
+        } if lib != None else {}
         all_libs = libs
         stub_dirs = [compiled.stubs]
 
@@ -784,10 +841,10 @@ def _build_haskell_lib(
         )
         ctx.actions.symlink_file(own_shared_lib.as_output(), non_profiling_shared_lib)
     shared_output = None
-    if dynamic_too:
+    if dynamic_too and objfiles:
         shared_libfile = "lib" + libname + dynamic_lib_suffix
         shared_lib_short_path = paths.join("lib-shared", shared_libfile)
-        dyn_objfiles = _srcs_to_objfiles(ctx, compiled.objects, "dyn_o")
+        dyn_objfiles = _srcs_to_objfiles(ctx, compiled, "dyn_o", c_osuf = "o")
         shared_lib, shared_solib, shared_link_infos = _link_haskell_shared_lib(
             ctx,
             haskell_toolchain,
@@ -836,6 +893,38 @@ def _build_haskell_lib(
             compiled = compiled,
             libs = [shared_lib],
         )
+    elif dynamic_too:
+        # No objects (see above): the "shared" variant is the same empty
+        # registration, so that consumers of either link style find the unit.
+        shared_db = _make_package(
+            ctx,
+            LinkStyle("shared"),
+            pkgname,
+            libname,
+            uniq_infos,
+            {False: compiled.hi},
+            {},
+            enable_profiling = False,
+            hi_link_style = link_style,
+            has_objects = False,
+        )
+        shared_output = HaskellLibBuildOutput(
+            hlib = HaskellLibraryInfo(
+                name = pkgname,
+                db = shared_db,
+                id = pkgname,
+                import_dirs = {False: compiled.hi},
+                stub_dirs = [compiled.stubs],
+                libs = [],
+                version = "1.0.0",
+                is_prebuilt = False,
+                profiling_enabled = False,
+            ),
+            solibs = {},
+            link_infos = LinkInfos(default = LinkInfo(pre_flags = ctx.attrs.exported_linker_flags)),
+            compiled = compiled,
+            libs = [],
+        )
 
     db = _make_package(
         ctx,
@@ -847,6 +936,7 @@ def _build_haskell_lib(
         library_artifacts,
         enable_profiling = enable_profiling,
         own_shared_lib = own_shared_lib,
+        has_objects = bool(objfiles),
     )
 
     hlib = HaskellLibraryInfo(
@@ -871,6 +961,11 @@ def _build_haskell_lib(
 
     return (main_output, shared_output)
 
+# A sublibrary built for one link style only (static, in GHC's stage 2)
+# serves the other styles too (see util.bzl's _lib_for_style).
+def _for_style(infos: dict, link_style: LinkStyle):
+    return infos[link_style] if link_style in infos else infos.values()[0]
+
 def haskell_library_impl(ctx: AnalysisContext) -> list[Provider]:
     preferred_linkage = _attr_preferred_linkage(ctx)
     if ctx.attrs.enable_profiling and preferred_linkage == Linkage("any"):
@@ -878,6 +973,7 @@ def haskell_library_impl(ctx: AnalysisContext) -> list[Provider]:
 
     # Get haskell and native link infos from all deps
     hlis = attr_deps_haskell_link_infos_sans_template_deps(ctx)
+    sublibs = attr_sublibraries_haskell_link_infos(ctx)
     nlis = attr_deps_merged_link_infos(ctx)
     prof_nlis = attr_deps_profiling_link_infos(ctx)
     shared_library_infos = attr_deps_shared_library_infos(ctx)
@@ -905,7 +1001,12 @@ def haskell_library_impl(ctx: AnalysisContext) -> list[Provider]:
     # while splicing in a letter so the component is never purely numeric
     # (e.g. "0.6.4.0" -> "0d6d4d0") is accepted regardless of position.
     libname = repr(ctx.label.path).replace("//", "_").replace("/", "_").replace(".", "d").removesuffix("_") + "_" + ctx.label.name
-    pkgname = libname.replace("_", "-")
+    # The unit id GHC compiles with (-this-unit-id) and registers. A
+    # Cabal-generated rule passes Cabal's own unit id (e.g.
+    # "base-4.22.0.0-inplace", or "rts" when the .cabal file fixes it):
+    # GHC's wired-in packages are recognised by package name, so the
+    # registered name/id must be the real ones, not label-derived.
+    pkgname = ctx.attrs.unit_id if ctx.attrs.unit_id != None else libname.replace("_", "-")
 
     haskell_toolchain = ctx.attrs._haskell_toolchain[HaskellToolchainInfo]
     native_shared_libs_dir = (
@@ -940,7 +1041,7 @@ def haskell_library_impl(ctx: AnalysisContext) -> list[Provider]:
             prof_hlink_infos[link_style] = ctx.actions.tset(
                 HaskellLibraryInfoTSet,
                 value = hlib,
-                children = [li.prof_info[link_style] for li in hlis],
+                children = [li.prof_info[link_style] for li in hlis] + [_for_style(li.prof_info, link_style) for li in sublibs],
             )
             prof_link_infos[link_style] = hlib_build_out.link_infos
         else:
@@ -948,7 +1049,7 @@ def haskell_library_impl(ctx: AnalysisContext) -> list[Provider]:
             hlink_infos[link_style] = ctx.actions.tset(
                 HaskellLibraryInfoTSet,
                 value = hlib,
-                children = [li.info[link_style] for li in hlis],
+                children = [li.info[link_style] for li in hlis] + [_for_style(li.info, link_style) for li in sublibs],
             )
             link_infos[link_style] = hlib_build_out.link_infos
 
@@ -1005,7 +1106,7 @@ def haskell_library_impl(ctx: AnalysisContext) -> list[Provider]:
                 enable_profiling = enable_profiling,
                 native_shared_libs_dir = native_shared_libs_dir,
                 non_profiling_hlib = non_profiling_hlib.get(link_style),
-                non_profiling_shared_lib = non_profiling_shared.libs[0] if (enable_profiling and non_profiling_shared) else None,
+                non_profiling_shared_lib = non_profiling_shared.libs[0] if (enable_profiling and non_profiling_shared and non_profiling_shared.libs) else None,
                 build_shared_too = (build_shared_too and link_style == LinkStyle("static") and not enable_profiling),
             )
             if not enable_profiling:
@@ -1089,7 +1190,11 @@ def haskell_library_impl(ctx: AnalysisContext) -> list[Provider]:
     #        args =
     #            flatten([["-isystem", dir] for dir in hlib_infos[actual_link_style].stub_dirs]),
     #    )]
-    pp = []
+    # The package's C headers for dependents (Cabal's include-dirs), as a
+    # cxx_library exports its headers; see the include_dirs attribute.
+    pp = [CPreprocessor(
+        args = CPreprocessorArgs(args = flatten([["-I", d] for d in ctx.attrs.include_dirs]) + ctx.attrs.exported_preprocessor_flags),
+    )]
 
     providers = [
         DefaultInfo(
@@ -1218,9 +1323,14 @@ def haskell_binary_impl(ctx: AnalysisContext) -> list[Provider]:
 
     link_args = cmd_args("-package-env=-")
 
+    # GHC links the RTS way it selects (-threaded, -debug) itself, through
+    # the package db, so the dbs of the dependencies are passed here too
+    # (the dependencies' own libraries are linked below, as archives).
+    link_args.add(get_packages_info(ctx, link_style, specify_pkg_version = False, enable_profiling = enable_profiling).packagedb_args)
+
     osuf, _hisuf = output_extensions(link_style, enable_profiling)
 
-    objfiles = _srcs_to_objfiles(ctx, compiled.objects, osuf)
+    objfiles = _srcs_to_objfiles(ctx, compiled, osuf)
     link_args.add(objfiles)
 
     indexing_tsets = {}
@@ -1406,7 +1516,13 @@ def haskell_binary_impl(ctx: AnalysisContext) -> list[Provider]:
     # first-class ordering mode already implemented in buck2's own tset
     # machinery - not a workaround - haskell_binary_impl here just never
     # requested it, always taking the `unpack_link_args` default.
+    # In one group: the C sources of a library and its Haskell modules
+    # are two archives that can reference each other (ghc-internal's
+    # RtsIface.c uses closures of its modules), and a single pass over the
+    # archives in topological order cannot resolve both directions.
+    link_args.add("-optl-Wl,--start-group")
     link_args.add(cmd_args(unpack_link_args(infos, link_ordering = LinkOrdering("topological")), prepend = "-optl"))
+    link_args.add("-optl-Wl,--end-group")
 
     link.add(
         at_argfile(

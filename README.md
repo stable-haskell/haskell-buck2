@@ -200,12 +200,97 @@ genrule(
 ## Sources outside the package directory
 
 An `hs-source-dirs` entry such as `../other-package` is referenced as
-`//<source dir>:<file>`. Put a `BUCK` file in that directory that exports
-the files under these names:
+`//<package>:<path>`, where the package is the nearest directory with a
+`BUCK` file (so that a package can still use its own files by path). Put
+the exports in that `BUCK` file:
 
 ```
 [export_file(name = f, src = f, visibility = ["PUBLIC"]) for f in glob(["**/*.hs"])]
 ```
+
+To remove an entry from a generated list, put `remove([...])` in the
+override list (`cabal_overrides.bzl`):
+
+```
+load("//buck2:cabal_overrides.bzl", "remove")
+
+generated_targets(overrides = {
+    "my-package": {"deps": [remove(["//other:dep"]), ":replacement"]},
+})
+```
+
+## What the generated rules carry
+
+Besides `srcs`, `compiler_flags`, `deps` and `packages`, `cabal buck2`
+fills in:
+
+- `unit_id`, `package_name`, `version`: the registration of the library,
+  as Cabal would register it (`-this-unit-id` in `ghc-options` wins over
+  the configured unit id, for GHC's wired-in units). A Cabal sub-library
+  gets `cabal_package` and `lib_name` too, so that GHC resolves a
+  `pkg:lib` unit id.
+- `reexported_modules`: `{new name: (library target or None, original
+  name)}` for `reexported-modules`; the registration gets `New from
+  <unit id>:Orig` with the registered id of that target.
+- `include_dirs`, `exported_preprocessor_flags`: the `include-dirs` of
+  the component, for the registration and for the dependents' Haskell
+  preprocessor and C compiler. The headers a `configure` script
+  generated into the build directory (`build-type: Configure`) are
+  copied to `cabal-buck2/autogen/<target>-configure-include/`, exported
+  as a `filegroup` and added here: the script runs when `cabal buck2`
+  configures the package.
+- `per_src_flags`: `{source: [flags]}` for the Stable Haskell Cabal
+  syntax `Jumps_V32.cmm (-mavx2)`; such a source is compiled on its own,
+  with the flags.
+- `hsc_flags`: the `-I` flags of the configure-generated headers, and
+  the component's `cabal_macros.h` (`--cflag=-include`).
+
+C sources: the `c-sources`, `cxx-sources`, `asm-sources` and
+`cmm-sources` of a component are compiled by GHC into the component's
+archive, as Cabal does, with `cc-options` as `-optc` flags; the
+component's headers are listed in `srcs` so that buck2 tracks them. One
+archive per unit is what GHC links when it links a program by itself, and
+the C and Haskell objects of a library can reference each other. A
+component with `pkgconfig-depends` keeps a `cxx_library` named
+`<target>-cxx` for its C sources. The C sources of an executable are
+linked as objects (a C `main` must come before the RTS). A header-only
+library (`include-dirs` only) is a `haskell_library` without sources: a
+registered unit whose `include-dirs` GHC reads. An executable with
+`main-is: foo.c` is a `cxx_binary`.
+
+## Sub-libraries linked by GHC
+
+`sublibraries = [...]` on a `haskell_library` makes the registrations of
+other libraries visible wherever this library is, without linking them:
+GHC links them itself through the package db. GHC's rts uses it for its
+ways (`rts:threaded-nodebug`, selected by `-threaded` when GHC links a
+program). The binary link passes the package dbs of the dependencies for
+this (`-package-db`); the dependencies' own archives are linked as before,
+in one `--start-group` so that a library's C archive and Haskell archive
+can reference each other.
+
+## An installation
+
+`haskell_package_db(name, deps)` (`package_db.bzl`) writes one package db
+with the registrations of `deps` and of everything they depend on, with
+absolute paths and every package exposed; `ghc -B<libdir>` with that db as
+`package.conf.d` compiles programs against the libraries buck2 built.
+A static-only library (`preferred_linkage = "static"`) is registered under
+`hs-libraries`, so that GHC links it in dependency order with the other
+Haskell libraries; a library with a shared variant stays an
+`extra-library` (GHC's interpreter loads it under that name).
+
+## Variants
+
+`cabal buck2 --variant NAME` generates `BUCK.NAME.cabal.bzl` files with
+targets suffixed `-NAME`, built in the platform
+`root//buck2/platforms:NAME` (a `platform()` with the constraint
+`root//buck2/constraints:NAME`) whose toolchain `toolchains/BUCK` selects
+from the `[haskell_NAME]` section of `.buckconfig` (`toolchains/stage2.bzl`).
+External packages come from the cell `third-party-haskell-NAME`. GHC's
+stage 2 is such a variant: the stage-1 compiler built by buck2 is the
+toolchain (`stage2_tool`), the libraries are static. Build tools (alex,
+happy, hsc2hs) are taken from the base variant.
 
 # Build modes
 

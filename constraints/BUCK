@@ -78,3 +78,18 @@ constraint_value(
     constraint_setting = ":profiling",
     visibility = ["PUBLIC"],
 )
+
+# Which stage of a bootstrapped compiler a target belongs to. Unset for an
+# ordinary build. `stage2` selects the stage-2 toolchain (see
+# toolchains/BUCK): the targets are compiled by a compiler that this
+# project builds itself, in the `stage2` target platform (platforms/BUCK).
+constraint_setting(
+    name = "stage",
+    visibility = ["PUBLIC"],
+)
+
+constraint_value(
+    name = "stage2",
+    constraint_setting = ":stage",
+    visibility = ["PUBLIC"],
+)

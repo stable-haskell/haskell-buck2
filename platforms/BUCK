@@ -101,3 +101,16 @@ execution_platforms(
     ],
     visibility = ["PUBLIC"],
 )
+
+# Target platform for stage-2 targets (`default_target_platform` of the
+# rules `cabal buck2 --variant stage2` generates): the default platform
+# plus the `stage2` constraint, which switches the Haskell toolchain to the
+# project's own stage-1 compiler. Build-mode modifiers (-m opt, ...) apply
+# on top of it as usual. Execution platforms are unaffected, so build
+# tools (exec deps) keep using the boot compiler.
+platform(
+    name = "stage2",
+    constraint_values = ["root//buck2/constraints:stage2"],
+    deps = ["prelude//platforms:default"],
+    visibility = ["PUBLIC"],
+)

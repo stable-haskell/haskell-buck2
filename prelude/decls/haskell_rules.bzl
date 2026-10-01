@@ -55,6 +55,7 @@ haskell_binary = prelude_rule(
         | {
             "deps_query": attrs.option(attrs.query(), default = None),
             "enable_profiling": attrs.bool(default = False),
+            "per_src_flags": attrs.dict(attrs.string(), attrs.list(attrs.string()), default = {}),  # see haskell_library
             "ghci_platform_preload_deps": attrs.list(attrs.tuple(attrs.regex(), attrs.set(attrs.dep(), sorted = True)), default = []),
             "ghci_preload_deps": attrs.set(attrs.dep(), sorted = True, default = []),
             "link_deps_query_whole": attrs.bool(default = False),
@@ -180,6 +181,42 @@ haskell_library = prelude_rule(
         | native_common.link_whole(link_whole_type = attrs.bool(default = False))
         | native_common.preferred_linkage(preferred_linkage_type = attrs.enum(Linkage.values()))
         | {
+            # The unit id to compile with (-this-unit-id) and to register the
+            # package under; derived from the target label when not given.
+            "unit_id": attrs.option(attrs.string(), default = None),
+            # The package name to register (`name:` in the .conf); the unit
+            # id when not given.
+            "package_name": attrs.option(attrs.string(), default = None),
+            # The `version:` of the package registration (GHC defines
+            # VERSION_<pkg> and MIN_VERSION_<pkg> from it for CPP).
+            "version": attrs.string(default = "1.0.0"),
+            # For a Cabal sub-library: the package's name and the library's
+            # name (`package-name:` and `lib-name:` of the registration).
+            "cabal_package": attrs.option(attrs.string(), default = None),
+            "lib_name": attrs.option(attrs.string(), default = None),
+            # Sub-libraries of the same Cabal package whose registrations
+            # are visible wherever this library is (their package dbs are
+            # passed to GHC) but which buck2 does not link: GHC links them
+            # itself through the package db, e.g. the RTS way it selects
+            # (-threaded, -debug) among the rts ways of a GHC build.
+            "sublibraries": attrs.list(attrs.dep(), default = []),
+            # Modules re-exported from a dependency (or from this library,
+            # with None): {new name: (library, original name)}, registered
+            # as `exposed-modules: New from <unit id>:Orig`.
+            "reexported_modules": attrs.dict(attrs.string(), attrs.tuple(attrs.option(attrs.dep()), attrs.string()), default = {}),
+            # Extra GHC flags for some of the srcs (keyed by their path in
+            # `srcs`): such a source is compiled on its own, with the flags,
+            # instead of in the --make run (e.g. a Cmm file that needs
+            # -mavx2 in GHC's rts).
+            "per_src_flags": attrs.dict(attrs.string(), attrs.list(attrs.string()), default = {}),
+            # C include directories of the package (Cabal's include-dirs):
+            # registered as the unit's `include-dirs:` (GHC reads e.g.
+            # DerivedConstants.h of the rts unit from there) and exported to
+            # dependents as -I flags, like a cxx_library's headers.
+            "include_dirs": attrs.list(attrs.source(allow_directory = True), default = []),
+            # Preprocessor flags exported to dependents (e.g. -I for an
+            # include directory that cannot be a source, such as `.`).
+            "exported_preprocessor_flags": attrs.list(attrs.arg(), default = []),
             "enable_profiling": attrs.bool(default = False),
             "ghci_platform_preload_deps": attrs.list(attrs.tuple(attrs.regex(), attrs.set(attrs.dep(), sorted = True)), default = []),
             "ghci_preload_deps": attrs.set(attrs.dep(), sorted = True, default = []),

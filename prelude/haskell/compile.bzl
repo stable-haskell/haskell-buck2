@@ -24,6 +24,7 @@ load(
     "attr_deps_haskell_lib_infos",
     "attr_deps_haskell_link_infos",
     "get_artifact_suffix",
+    "is_ghc_compiled_src",
     "is_haskell_src",
     "output_extensions",
     "srcs_to_pairs",
@@ -40,6 +41,9 @@ CompileResultInfo = record(
     hi = field(Artifact),
     stubs = field(Artifact),
     producing_indices = field(bool),
+    # Output directory of each source compiled on its own because of
+    # `per_src_flags` (keyed by the source's path in `srcs`); see compile().
+    persrc_objects = field(dict, {}),
 )
 
 CompileArgsInfo = record(
@@ -47,6 +51,13 @@ CompileArgsInfo = record(
     srcs = field(cmd_args),
     args_for_cmd = field(cmd_args),
     args_for_file = field(cmd_args),
+    # The args without the output directories (-odir, ...), for the
+    # per-source compiles of compile(), and those sources.
+    persrc_args = field(cmd_args),
+    persrc_srcs = field(list),
+    # False when nothing is passed to GHC's --make run (a header-only
+    # package, see haskell.bzl): the run is skipped.
+    has_srcs = field(bool),
 )
 
 PackagesInfo = record(
@@ -67,14 +78,24 @@ def get_packages_info(ctx: AnalysisContext, link_style: LinkStyle, specify_pkg_v
     # Collect library dependencies. Note that these don't need to be in a
     # particular order.
     direct_deps_link_info = attr_deps_haskell_link_infos(ctx)
+    # A dependency built for one link style only (a stage-2 library, static
+    # in every mode) serves the others too: the interfaces and the package
+    # db are what matters here.
+    def info_for(lib):
+        infos = lib.prof_info if enable_profiling else lib.info
+        return infos[link_style] if link_style in infos else infos[infos.keys()[0]]
+
     libs = ctx.actions.tset(
         HaskellLibraryInfoTSet,
-        children = [lib.prof_info[link_style] if enable_profiling else lib.info[link_style] for lib in direct_deps_link_info],
+        children = [info_for(lib) for lib in direct_deps_link_info],
     )
 
-    # base is special and gets exposed by default
+    # Only direct dependencies are exposed (below). `base` is not exposed
+    # implicitly: a package that needs it depends on it (buck2/haskell.bzl
+    # adds it to every target that is not itself a boot library), and the
+    # boot libraries of a GHC build (ghc-prim, rts, ...) must not see it.
     package_flag = _package_flag(haskell_toolchain)
-    exposed_package_args = cmd_args([package_flag, "base"])
+    exposed_package_args = cmd_args()
 
     packagedb_args = cmd_args()
     packagedb_set = {}
@@ -181,6 +202,10 @@ def compile_args(ctx: AnalysisContext, link_style: LinkStyle, enable_profiling: 
         # this matters enough to ask for explicitly rather than just
         # tolerating two compiles.
         compile_args.add("-dynamic-too")
+        # -dynamic-too compiles a C source once, to the ordinary .o: with
+        # PIC it serves the shared library too (see _srcs_to_objfiles in
+        # haskell.bzl).
+        compile_args.add("-optc-fPIC", "-optcxx-fPIC")
 
     osuf, hisuf = output_extensions(link_style, enable_profiling)
     compile_args.add("-osuf", osuf, "-hisuf", hisuf)
@@ -197,17 +222,6 @@ def compile_args(ctx: AnalysisContext, link_style: LinkStyle, enable_profiling: 
     )
     hi = ctx.actions.declare_output("hi-" + artifact_suffix, dir = True, has_content_based_path = False)
     stubs = ctx.actions.declare_output("stubs-" + artifact_suffix, dir = True, has_content_based_path = False)
-
-    compile_args.add(
-        "-odir",
-        objects.as_output(),
-        "-hidir",
-        hi.as_output(),
-        "-hiedir",
-        hi.as_output(),
-        "-stubdir",
-        stubs.as_output(),
-    )
 
     # Add -package-db and -package/-expose-package flags for each Haskell
     # library dependency.
@@ -226,16 +240,39 @@ def compile_args(ctx: AnalysisContext, link_style: LinkStyle, enable_profiling: 
     pre = cxx_merge_cpreprocessors(ctx.actions, [], inherited_pre)
     pre_args = pre.set.project_as_args("args")
     compile_args.add(cmd_args(pre_args, format = "-optP={}"))
+    # The same for the C compiler: GHC compiles C sources given in srcs
+    # (and the C stubs) with cc, which gets -optc flags, not -optP ones.
+    compile_args.add(cmd_args(pre_args, format = "-optc{}"))
 
     if pkgname:
         compile_args.add(["-this-unit-id", pkgname])
 
+    # Everything above also applies to a source compiled on its own (see
+    # compile() and `per_src_flags`); the output directories below are
+    # this --make run's own.
+    persrc_args = compile_args.copy()
+
+    compile_args.add(
+        "-odir",
+        objects.as_output(),
+        "-hidir",
+        hi.as_output(),
+        "-hiedir",
+        hi.as_output(),
+        "-stubdir",
+        stubs.as_output(),
+    )
+
+    per_src_flags = getattr(ctx.attrs, "per_src_flags", {})
     arg_srcs = []
     hidden_srcs = []
+    persrc_srcs = []
     for path, src in srcs_to_pairs(ctx.attrs.srcs):
         # hs-boot files aren't expected to be an argument to compiler but does need
         # to be included in the directory of the associated src file
-        if is_haskell_src(path):
+        if path in per_src_flags:
+            persrc_srcs.append((path, src))
+        elif is_ghc_compiled_src(path):
             arg_srcs.append(src)
         else:
             hidden_srcs.append(src)
@@ -269,6 +306,9 @@ def compile_args(ctx: AnalysisContext, link_style: LinkStyle, enable_profiling: 
             producing_indices = producing_indices,
         ),
         srcs = srcs,
+        persrc_args = persrc_args,
+        persrc_srcs = persrc_srcs,
+        has_srcs = len(arg_srcs) > 0,
         args_for_cmd = compile_cmd,
         args_for_file = compile_args,
     )
@@ -307,11 +347,17 @@ def compile(ctx: AnalysisContext, link_style: LinkStyle, enable_profiling: bool,
     # project's existing convention of resolving tools via $PATH at
     # build-action time rather than baking absolute host paths into .bzl
     # or BUCK files (see toolchains/BUCK's `compiler`/`packager`).
-    run_cmd = compile_cmd
     env_exports = "".join([
         'export {}="{}"; '.format(name, value)
         for name, value in haskell_toolchain.compile_env.items()
     ]) if haskell_toolchain.compile_env else ""
+
+    # The output directories are created first: GHC does not create -hidir
+    # or -stubdir when nothing is written to them (a library of C and Cmm
+    # sources only, such as GHC's rts), and an action must produce all its
+    # declared outputs.
+    outdirs = [args.result.objects.as_output(), args.result.hi.as_output(), args.result.stubs.as_output()]
+    mkdirs = 'mkdir -p "$1" "$2" "$3"; shift 3; '
 
     build_tool_dirs = {
         dep[DefaultInfo].default_outputs[0].basename: dep[DefaultInfo].default_outputs[0]
@@ -324,23 +370,71 @@ def compile(ctx: AnalysisContext, link_style: LinkStyle, enable_profiling: bool,
             has_content_based_path = False,
         )
         run_cmd = cmd_args(
-            ["sh", "-c", env_exports + 'export PATH="$PATH:$1"; shift; exec "$@"', "sh", build_tool_bin_dir],
+            ["sh", "-c", mkdirs + env_exports + 'export PATH="$PATH:$1"; shift; exec "$@"', "sh"] + outdirs + [build_tool_bin_dir],
             compile_cmd,
         )
-    elif haskell_toolchain.compile_env:
-        run_cmd = cmd_args(["sh", "-c", env_exports + 'exec "$@"', "sh"], compile_cmd)
+    else:
+        run_cmd = cmd_args(["sh", "-c", mkdirs + env_exports + 'exec "$@"', "sh"] + outdirs, compile_cmd)
 
-    ctx.actions.run(
-        run_cmd,
-        category = "haskell_compile_" + artifact_suffix.replace("-", "_"),
-        # Keep the previous run's -odir/-hidir so that `ghc --make` can do its
-        # own recompilation checking and only rebuild the modules whose
-        # sources or imported interfaces changed, rather than the whole
-        # package. GHC >= 9.4 tracks file changes with hashes rather than
-        # timestamps, so this is safe even though Buck doesn't preserve
-        # timestamps on artifacts.
-        no_outputs_cleanup = True,
-        env = {"LD_LIBRARY_PATH": cmd_args(native_shared_libs_dir)} if native_shared_libs_dir != None else {},
+    if not args.has_srcs:
+        # Nothing to compile (a header-only package): GHC would fail with
+        # "no input files"; the output directories exist, empty.
+        ctx.actions.run(
+            cmd_args("mkdir", "-p", args.result.objects.as_output(), args.result.hi.as_output(), args.result.stubs.as_output()),
+            category = "haskell_compile_" + artifact_suffix.replace("-", "_"),
+        )
+    else:
+        ctx.actions.run(
+            run_cmd,
+            category = "haskell_compile_" + artifact_suffix.replace("-", "_"),
+            # Keep the previous run's -odir/-hidir so that `ghc --make` can do its
+            # own recompilation checking and only rebuild the modules whose
+            # sources or imported interfaces changed, rather than the whole
+            # package. GHC >= 9.4 tracks file changes with hashes rather than
+            # timestamps, so this is safe even though Buck doesn't preserve
+            # timestamps on artifacts.
+            no_outputs_cleanup = True,
+            env = {"LD_LIBRARY_PATH": cmd_args(native_shared_libs_dir)} if native_shared_libs_dir != None else {},
+        )
+
+    # A source with `per_src_flags` is compiled on its own, with the same
+    # arguments plus its flags, into its own output directory (an action
+    # cannot write into the --make run's output directories).
+    # haskell.bzl's _srcs_to_objfiles takes its object from there.
+    per_src_flags = getattr(ctx.attrs, "per_src_flags", {})
+    persrc_objects = {}
+    for path, src in args.persrc_srcs:
+        odir = ctx.actions.declare_output(
+            "objects-" + artifact_suffix + "-persrc-" + path.replace("/", "_"),
+            dir = True,
+            has_content_based_path = False,
+        )
+        persrc_cmd = cmd_args(
+            haskell_toolchain.compiler,
+            args.args_for_cmd,
+            args.persrc_args,
+            per_src_flags[path],
+            "-c",
+            src,
+            "-odir",
+            odir.as_output(),
+            "-hidir",
+            odir.as_output(),
+            "-stubdir",
+            odir.as_output(),
+        )
+        ctx.actions.run(
+            persrc_cmd,
+            category = "haskell_compile_persrc_" + artifact_suffix.replace("-", "_"),
+            identifier = path,
+            env = {"LD_LIBRARY_PATH": cmd_args(native_shared_libs_dir)} if native_shared_libs_dir != None else {},
+        )
+        persrc_objects[path] = odir
+
+    return CompileResultInfo(
+        objects = args.result.objects,
+        hi = args.result.hi,
+        stubs = args.result.stubs,
+        producing_indices = args.result.producing_indices,
+        persrc_objects = persrc_objects,
     )
-
-    return args.result

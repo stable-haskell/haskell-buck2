@@ -24,9 +24,13 @@ def _hsc2hs_impl(ctx: AnalysisContext) -> list[Provider]:
     # version from the haskell toolchain's own compiler name instead
     # (buck2/toolchains/BUCK sets compiler = "ghc-" + GHC_VERSION, read
     # from Cabal's own resolved plan - see buck2/gen-haskell-prebuilt.py).
-    ghc_compiler = ctx.attrs._haskell_toolchain[HaskellToolchainInfo].compiler
-    ghc_version = ghc_compiler[len("ghc-"):] if ghc_compiler.startswith("ghc-") else ghc_compiler
-    hsc2hs_tool = "hsc2hs-" + ghc_version
+    toolchain = ctx.attrs._haskell_toolchain[HaskellToolchainInfo]
+    if toolchain.hsc2hs != None:
+        hsc2hs_tool = toolchain.hsc2hs
+    else:
+        ghc_compiler = toolchain.compiler
+        ghc_version = ghc_compiler[len("ghc-"):] if ghc_compiler.startswith("ghc-") else ghc_compiler
+        hsc2hs_tool = "hsc2hs-" + ghc_version
 
     cxx_compiler = get_cxx_toolchain_info(ctx).cxx_compiler_info.compiler
 
@@ -68,7 +72,9 @@ hsc2hs = rule(
         "boot": attrs.option(attrs.source(), default = None),
         "boot_out": attrs.option(attrs.string(), default = None),
         "deps": attrs.list(attrs.dep(), default = []),
-        "extra_flags": attrs.list(attrs.string(), default = []),
+        # attrs.arg(): a flag may hold a $(location ...) macro, e.g. -I of
+        # a generated header directory.
+        "extra_flags": attrs.list(attrs.arg(), default = []),
         "hsc_file": attrs.source(),
         "out": attrs.string(),
         "_cxx_toolchain": toolchains_common.cxx(),

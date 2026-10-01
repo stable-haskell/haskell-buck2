@@ -53,7 +53,11 @@ def _compiler_flags_arg():
 def _build_tool_depends_arg():
     return {
         "build_tool_depends": attrs.list(
-            attrs.dep(),
+            # An exec_dep: a build tool runs on the build machine, so it is
+            # built for the execution platform, whatever the target
+            # configuration of this rule is (e.g. a stage-2 GHC library
+            # uses the stage-1 genprimopcode).
+            attrs.exec_dep(),
             default = [],
             doc = """
     Executables (haskell_binary(), export_exe(), or anything else with a

@@ -10,6 +10,7 @@ load("@prelude//:paths.bzl", "paths")
 load(
     "@prelude//haskell:library_info.bzl",
     "HaskellLibraryInfo",
+    "HaskellLibraryInfoTSet",
     "HaskellLibraryProvider",
 )
 load(
@@ -48,12 +49,48 @@ def is_haskell_src(x: str) -> bool:
     _, ext = paths.split_extension(x)
     return ext in HASKELL_EXTENSIONS
 
+# Non-Haskell sources that GHC compiles when they are given on its command
+# line (`ghc --make M.hs foo.c bar.cmm`): C files and C-- files. GHC puts
+# their objects under -odir with the source's relative path, like a
+# module's object, so they are archived with the modules. They are not
+# modules: no .hi, no entry in the package's exposed-modules.
+GHC_COMPILED_EXTENSIONS = [
+    ".c",
+    ".cpp",
+    ".cc",
+    ".cxx",
+    ".cmm",
+    ".S",
+    ".s",
+]
+
+def is_ghc_compiled_src(x: str) -> bool:
+    _, ext = paths.split_extension(x)
+    return ext in HASKELL_EXTENSIONS or ext in GHC_COMPILED_EXTENSIONS
+
 def src_to_module_name(x: str) -> str:
     base, _ext = paths.split_extension(x)
     return base.replace("/", ".")
 
 def attr_deps(ctx: AnalysisContext) -> list[Dependency]:
     return ctx.attrs.deps
+
+# The `sublibraries` of a haskell_library (see haskell_rules.bzl), as link
+# infos that hold their own registration only (not those of their
+# dependencies): haskell_library_impl adds them to the library's own
+# transitive set, so that they are visible wherever the library is, but
+# they are not linked and the library's registration does not depend on
+# them.
+def attr_sublibraries_haskell_link_infos(ctx: AnalysisContext) -> list[HaskellLinkInfo]:
+    infos = []
+    for d in getattr(ctx.attrs, "sublibraries", []):
+        li = d.get(HaskellLinkInfo)
+        if li != None:
+            infos.append(HaskellLinkInfo(
+                info = {k: ctx.actions.tset(HaskellLibraryInfoTSet, value = v.value) for k, v in li.info.items()},
+                prof_info = {k: ctx.actions.tset(HaskellLibraryInfoTSet, value = v.value) for k, v in li.prof_info.items()},
+            ))
+    return infos
 
 def attr_deps_haskell_link_infos(ctx: AnalysisContext) -> list[HaskellLinkInfo]:
     return dedupe(
@@ -72,11 +109,16 @@ def attr_deps_haskell_link_infos_sans_template_deps(ctx: AnalysisContext) -> lis
         )
     )
 
+# A library built for one link style only (a stage-2 library, static in
+# every mode) serves the other styles too.
+def _lib_for_style(libs, link_style):
+    return libs[link_style] if link_style in libs else libs[libs.keys()[0]]
+
 def attr_deps_haskell_lib_infos(ctx: AnalysisContext, link_style: LinkStyle, enable_profiling: bool) -> list[HaskellLibraryInfo]:
     if enable_profiling and link_style == LinkStyle("shared"):
         fail("Profiling isn't supported when using dynamic linking")
     return [
-        x.prof_lib[link_style] if enable_profiling else x.lib[link_style]
+        _lib_for_style(x.prof_lib if enable_profiling else x.lib, link_style)
         for x in filter(None, [d.get(HaskellLibraryProvider) for d in attr_deps(ctx) + ctx.attrs.template_deps])
     ]
 

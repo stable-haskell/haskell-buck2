@@ -1,5 +1,6 @@
 load("@prelude//toolchains:demo.bzl", "system_demo_toolchains")
 load("@toolchains//haskell.bzl", "haskell_toolchain")
+load("@toolchains//stage2.bzl", "stage2_tool")
 load("@third-party-haskell//:tools.bzl", "GHC_DYNAMIC", "GHC_VERSION")
 
 # Defaults for other toolchains
@@ -18,10 +19,18 @@ system_demo_toolchains()
 # plan.json - see that script's own comment) rather than being hardcoded
 # here, so re-running that script after `cabal build all
 # --only-dependencies -w ghc-<version>` retargets this too.
+# Stage 2: see stage2.bzl.
 haskell_toolchain(
     name = "haskell",
     compiler = "ghc-" + GHC_VERSION,
     packager = "ghc-pkg-" + GHC_VERSION,
+    # The boot compiler's hsc2hs for every stage: it adds no include dir
+    # of its own that matters, and the .hsc rule passes the headers of the
+    # deps (a stage-2 .hsc file gets the stage-2 rts headers).
+    hsc2hs = "hsc2hs-" + GHC_VERSION,
+    compiler_exe = stage2_tool("compiler"),
+    packager_exe = stage2_tool("packager"),
+    hsc2hs_exe = stage2_tool("hsc2hs"),
     haddock = "haddock",
     compiler_flags = [],
     linker_flags = [],
