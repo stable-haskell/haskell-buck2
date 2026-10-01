@@ -162,6 +162,51 @@ haskell_test(
 
 You can find docs on how to write `BUCK` files in the Buck2 docs, e.g. [haskell_library](https://buck2.build/docs/prelude/rules/haskell/haskell_library/).
 
+## Extending a generated target
+
+`cabal buck2` writes the rule calls into `BUCK.cabal.bzl` and a two-line
+`BUCK` that calls `generated_targets()`. To add to a generated rule (an
+include directory with generated files, extra sources, extra deps) pass
+`overrides`, keyed by target name. Lists are appended, dicts are merged,
+other values are replaced:
+
+```
+load(":BUCK.cabal.bzl", "generated_targets")
+
+generated_targets(overrides = {
+    "my-package": {
+        "compiler_flags": ["-I$(location :generated-headers)"],
+        "srcs": {"Extra/Module.hs": "Extra/Module.hs"},
+    },
+})
+```
+
+## Autogen modules
+
+`cabal buck2` generates `Paths_<pkg>` and `PackageInfo_<pkg>` itself. Any
+other module in `autogen-modules` (normally produced by a Custom
+`Setup.hs`, which `cabal buck2` does not run) is referenced as the
+same-package target `:autogen-<Module.Name>`. Define it in `BUCK` with a
+`genrule` or an `export_file` whose output is the module source:
+
+```
+genrule(
+    name = "autogen-GHC.Platform.Constants",
+    out = "Constants.hs",
+    cmd = "$(exe //utils/deriveConstants:deriveConstants) --gen-haskell-type -o $OUT --target-os OSLinux",
+)
+```
+
+## Sources outside the package directory
+
+An `hs-source-dirs` entry such as `../other-package` is referenced as
+`//<source dir>:<file>`. Put a `BUCK` file in that directory that exports
+the files under these names:
+
+```
+[export_file(name = f, src = f, visibility = ["PUBLIC"]) for f in glob(["**/*.hs"])]
+```
+
 # Build modes
 
 The Buck2 build system has two build modes:
