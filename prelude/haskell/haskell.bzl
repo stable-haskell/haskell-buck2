@@ -1516,13 +1516,7 @@ def haskell_binary_impl(ctx: AnalysisContext) -> list[Provider]:
     # first-class ordering mode already implemented in buck2's own tset
     # machinery - not a workaround - haskell_binary_impl here just never
     # requested it, always taking the `unpack_link_args` default.
-    # In one group: the C sources of a library and its Haskell modules
-    # are two archives that can reference each other (ghc-internal's
-    # RtsIface.c uses closures of its modules), and a single pass over the
-    # archives in topological order cannot resolve both directions.
-    link_args.add("-optl-Wl,--start-group")
     link_args.add(cmd_args(unpack_link_args(infos, link_ordering = LinkOrdering("topological")), prepend = "-optl"))
-    link_args.add("-optl-Wl,--end-group")
 
     link.add(
         at_argfile(

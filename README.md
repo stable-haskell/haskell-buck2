@@ -219,6 +219,14 @@ generated_targets(overrides = {
 })
 ```
 
+`cabal buck2 [targets]` generates the rules for the local packages
+(`all`) or for the given targets, e.g. `all exe:hsc2hs` for an
+executable of a source-repository package. The packages cabal unpacks
+under `dist-newstyle/src/<name>-<version or hash>/` also get an `alias()`
+per target in `dist-newstyle/src/BUCK.cabal.bzl`, so that
+`//dist-newstyle/src:bytestring` is a stable label (a name two packages
+share is qualified: `//dist-newstyle/src:hpc-bin/hpc`).
+
 ## What the generated rules carry
 
 Besides `srcs`, `compiler_flags`, `deps` and `packages`, `cabal buck2`
@@ -244,6 +252,9 @@ fills in:
   with the flags.
 - `hsc_flags`: the `-I` flags of the configure-generated headers, and
   the component's `cabal_macros.h` (`--cflag=-include`).
+- `<pkg>-data`: a `filegroup` with the package's `data-files`, for a
+  hand-written rule that installs them (Cabal's `Paths_<pkg>` module does
+  not find them in a buck2 build).
 
 C sources: the `c-sources`, `cxx-sources`, `asm-sources` and
 `cmm-sources` of a component are compiled by GHC into the component's
@@ -281,6 +292,22 @@ Haskell libraries; a library with a shared variant stays an
 `extra-library` (GHC's interpreter loads it under that name).
 
 ## Variants
+
+A hand-maintained `BUCK` that loads a variant's generated file
+(`BUCK.stage2.cabal.bzl`) would not parse before that variant is
+generated, so the base generation writes a stub for every such missing
+file, with `GENERATED = False`; a generated file has `GENERATED = True`.
+Hand-maintained rules of a variant test it, so that `buck2 build //...`
+is the base variant until the variant is generated:
+
+```
+load(":BUCK.stage2.cabal.bzl", "GENERATED", generated_targets_stage2 = "generated_targets")
+
+def stage2_rules():
+    if not GENERATED:
+        return
+    ...
+```
 
 `cabal buck2 --variant NAME` generates `BUCK.NAME.cabal.bzl` files with
 targets suffixed `-NAME`, built in the platform
